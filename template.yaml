@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform:
+- AWS::Serverless-2016-10-31
+
+Parameters:
+  EventBusName:
+    Type: String
+    Description: 'The name of the event bus that captures Auth0 events'
+  GlueDatabaseName:
+    Type: String
+    Description: 'The name of the Glue database'
+    Default: 'auth0_event_logs'
+  BufferingHintsSizeInMBs:
+    Type: Number
+    Default: 1
+    Description: 'The size of the buffer, in MBs, that Kinesis Data Firehose uses for incoming data before delivering it to the S3 bucket'
+  BufferingHintsIntervalInSeconds:
+    Type: Number   
+    Default: 60
+    Description: 'The length of time, in seconds, that Kinesis Data Firehose buffers incoming data before delivering it to the S3 bucket'
+
+Outputs:
+  GlueDatabaseName:
+    Value: !Ref GlueDatabaseName
+    Description: 'The name of the Glue database'
+  LogBucket:
+    Value: !Ref LogBucket
+    Description: 'The name of the S3 bucket holding the log files'
+  DeliveryStreamLogGroup:
+    Value: !Ref DeliveryStreamLogGroup
+    Description: 'The name of the CloudWatch log group that contains logs for Kinesis Data Firehose errors'
+  DeliveryStreamLogStream:
+    Value: !Ref DeliveryStreamLogStream
+    Description: 'The name of the CloudWatch log stream that contains logs for Kinesis Data Firehose errors'
+  GlueTableName:
+    Value: 'auth0_logs'
+    Description: 'The name of the Glue table for auth0 event logs'
+
+Resources:
+
+  ### LOGS ###
+
+
+  # S3 bucket containing log files
+  LogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Function:
+              Fn::GetAtt:
+              - CreatePartitionFunction
+              - Arn
+            Filter:
+              S3Key:
+                  Rules:
+                  - Name: suffix
+                    Value: .gz
+                  - Name: prefix
+                    Value: logs
+            Event: s3:ObjectCreated:*
+
+
+  # Glue database for Auth0 event logs
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+
+
+  # Glue table for build state change events
+  LogsTable:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput: 
+        Name: auth0_logs
+        PartitionKeys:
+          - Type: date
+            Name: date
+          - Type: string
+            Name: hour
+        TableType: EXTERNAL_TABLE
+        StorageDescriptor:
+            OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+            InputFormat: org.apache.hadoop.mapred.TextInputFormat
+            Location: !Sub 's3://${LogBucket}/logs/'
+            StoredAsSubDirectories: false
+            SerdeInfo:
+                SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+                Parameters:
+                    serialization.format: '1'
+            Columns:
+                - 
+                  Name: log_id 
+                  Type: string
+                - 
+                  Name: timestamp
+                  Type: string
+                - 
+                  Name: connection
+                  Type: string
+                - 
+                  Name: connection_id
+                  Type: string
+                - 
+                  Name: client_id
+                  Type: string
+                - 
+                  Name: ip
+                  Type: string
+                - 
+                  Name: user_id
+                  Type: string
+                - 
+                  Name: user_name
+                  Type: string
+                - 
+                  Name: description
+                  Type: string
+                - 
+                  Name: user_agent
+                  Type: string
+                - 
+                  Name: type
+                  Type: string
+                - 
+                  Name: strategy
+                  Type: string
+                - 
+                  Name: strategy_type
+                  Type: string
+                - 
+                  Name: hostname
+                  Type: string
+                - 
+                  Name: details
+                  Type: string
+
+
+  # Lambda function that attempts to create a Glue partition when a log file is put into the S3 bucket
+  CreatePartitionFunction:
+      Type: AWS::Serverless::Function
+      Properties:
+          Handler: index.handler
+          Runtime: python3.8
+          CodeUri: lambdas/create-partition
+          Timeout : 20
+          Environment:
+            Variables:
+                DATABASE_NAME: !Ref GlueDatabase
+                TABLE_NAME: 'auth0_logs'
+          Policies:
+            -
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 'glue:BatchCreatePartition'
+                    - 'glue:CreatePartition'
+                  Resource: "*"
+                        
+  # Lambda function permission to allow S3 to invoke 'CreatePartitionFunction'
+  CreatePartitionFunctionDumpEventPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+          Action: lambda:InvokeFunction
+          SourceAccount:
+              Ref: AWS::AccountId
+          FunctionName:
+              Ref: CreatePartitionFunction
+          Principal: s3.amazonaws.com
+
+  
+  ### LOG DELIVERY ###
+
+  # Firehose delivery stream that aggregates Auth0 events into log files 
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt DeliveryStreamRole.Arn
+        BucketARN: !Sub 'arn:aws:s3:::${LogBucket}'
+        Prefix: 'logs/'
+        ErrorOutputPrefix: 'error/!{firehose:error-output-type}/year=!{timestamp:YYYY}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        BufferingHints:
+            SizeInMBs: !Ref BufferingHintsSizeInMBs
+            IntervalInSeconds: !Ref BufferingHintsIntervalInSeconds
+        CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref DeliveryStreamLogGroup
+          LogStreamName: !Ref DeliveryStreamLogStream
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            -
+                Type: Lambda
+                Parameters:
+                  - 
+                    ParameterName: LambdaArn
+                    ParameterValue: !GetAtt FirehoseTransformFunction.Arn
+                      
+  # Lambda function that transforms Auth0 events to fit the schema of the Glue tables
+  FirehoseTransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.8
+      CodeUri: lambdas/firehose-transform
+      Timeout: 60
+
+  # A CloudWatch log group to hold error logs for the Firehose delivery streams
+  DeliveryStreamLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+
+  # A CloudWatch log stream to hold error logs for the Firehose delivery streams
+  DeliveryStreamLogStream:
+    Type: 'AWS::Logs::LogStream'
+    Properties:
+      LogGroupName: !Ref DeliveryStreamLogGroup
+
+  # An IAM role giving the Firehose delivery streams access to the S3 log bucket, the CloudWatch log group/stream, and the transformation Lambda function
+  DeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+        AssumeRolePolicyDocument:
+            Version: 2012-10-17
+            Statement:
+                - Sid: ''
+                  Effect: Allow
+                  Principal:
+                    Service: firehose.amazonaws.com
+                  Action: 'sts:AssumeRole'
+                  Condition:
+                    StringEquals:
+                        'sts:ExternalId': !Ref 'AWS::AccountId'
+        Path: "/"
+        Policies:
+            - PolicyName: firehose_delivery_policy
+              PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    - Effect: Allow
+                      Action:
+                        - 's3:AbortMultipartUpload'
+                        - 's3:GetBucketLocation'
+                        - 's3:GetObject'
+                        - 's3:ListBucket'
+                        - 's3:ListBucketMultipartUploads'
+                        - 's3:PutObject'
+                      Resource:
+                            - !Join 
+                                - ''
+                                - - 'arn:aws:s3:::'
+                                  - !Ref LogBucket
+                            - !Join 
+                                - ''
+                                - - 'arn:aws:s3:::'
+                                  - !Ref LogBucket
+                                  - '/*'
+                    - Effect: Allow
+                      Action:
+                        - 'logs:PutLogEvents'
+                      Resource:
+                        - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${DeliveryStreamLogGroup}:log-stream:${DeliveryStreamLogStream}"
+                    - Effect: Allow
+                      Action:
+                            - 'lambda:InvokeFunction'
+                      Resource:
+                            - !GetAtt FirehoseTransformFunction.Arn
+
+
+  ### EVENTS ###
+
+  # Event rule capturing Auth0 events
+  EventRule: 
+      Type: AWS::Events::Rule
+      Properties: 
+        EventBusName: !Ref EventBusName
+        EventPattern: 
+          source:
+            - 
+              prefix: 'aws.partner/auth0.com'
+        State: "ENABLED"
+        Targets:
+          - Arn: !GetAtt DeliveryStream.Arn
+            Id: auth0-events
+            RoleArn: !GetAtt EventsRole.Arn
+
+
+  # IAM role giving the event rules permission to put records in the Firehose delivery streams
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+              - Sid: ''
+                Effect: Allow
+                Principal:
+                  Service: events.amazonaws.com
+                Action: 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'firehose:PutRecord'
+                  - 'firehose:PutRecordBatch'
+                Resource: 
+                  - !GetAtt DeliveryStream.Arn
