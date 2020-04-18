@@ -111,6 +111,9 @@ Resources:
                   Name: client_id
                   Type: string
                 - 
+                  Name: client_name
+                  Type: string
+                - 
                   Name: ip
                   Type: string
                 - 

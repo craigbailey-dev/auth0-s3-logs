@@ -49,6 +49,10 @@ def handler(event, context):
                         "Type": "string"
                     },
                     {
+                        "Name": "client_name",
+                        "Type": "string"
+                    },
+                    {
                         "Name": "ip",
                         "Type": "string"
                     },
