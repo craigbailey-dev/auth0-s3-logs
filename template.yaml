@@ -9,6 +9,7 @@ Parameters:
   LambdaDesintationEventBusName:
     Type: String
     Description: 'The name of the event bus to which Lambda error events are sent'    
+    Default: 'auth0_event_logs_lambda_destination'
   GlueDatabaseName:
     Type: String
     Description: 'The name of the Glue database'
