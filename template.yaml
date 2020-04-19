@@ -6,6 +6,9 @@ Parameters:
   EventBusName:
     Type: String
     Description: 'The name of the event bus that captures Auth0 events'
+  LambdaDesintationEventBusName:
+    Type: String
+    Description: 'The name of the event bus to which Lambda error events are sent'    
   GlueDatabaseName:
     Type: String
     Description: 'The name of the Glue database'
@@ -23,6 +26,9 @@ Outputs:
   GlueDatabaseName:
     Value: !Ref GlueDatabaseName
     Description: 'The name of the Glue database'
+  LambdaDesintationEventBusName:
+    Value: !Ref LambdaDesintationEventBusName
+    Description: 'The name of the event bus to which Lambda error events are sent'    
   LogBucket:
     Value: !Ref LogBucket
     Description: 'The name of the S3 bucket holding the log files'
@@ -147,37 +153,50 @@ Resources:
 
   # Lambda function that attempts to create a Glue partition when a log file is put into the S3 bucket
   CreatePartitionFunction:
-      Type: AWS::Serverless::Function
-      Properties:
-          Handler: index.handler
-          Runtime: python3.8
-          CodeUri: lambdas/create-partition
-          Timeout : 20
-          Environment:
-            Variables:
-                DATABASE_NAME: !Ref GlueDatabase
-                TABLE_NAME: 'auth0_logs'
-          Policies:
-            -
-              Statement:
-                - Effect: Allow
-                  Action:
-                    - 'glue:BatchCreatePartition'
-                    - 'glue:CreatePartition'
-                  Resource: "*"
+    Type: AWS::Serverless::Function
+    Properties:
+        Handler: index.handler
+        Runtime: python3.8
+        CodeUri: lambdas/create-partition
+        Timeout : 20
+        Environment:
+          Variables:
+              DATABASE_NAME: !Ref GlueDatabase
+              TABLE_NAME: 'auth0_logs'
+        EventInvokeConfig:
+          DestinationConfig:
+            OnFailure:
+              Type: EventBridge
+              Destination: !GetAtt LambdaDesintationEventBus.Arn
+        Policies:
+          - EventBridgePutEventsPolicy:
+              EventBusName: !Ref LambdaDesintationEventBus
+          -
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'glue:BatchCreatePartition'
+                  - 'glue:CreatePartition'
+                Resource: "*"
                         
   # Lambda function permission to allow S3 to invoke 'CreatePartitionFunction'
   CreatePartitionFunctionDumpEventPermission:
-      Type: AWS::Lambda::Permission
-      Properties:
-          Action: lambda:InvokeFunction
-          SourceAccount:
-              Ref: AWS::AccountId
-          FunctionName:
-              Ref: CreatePartitionFunction
-          Principal: s3.amazonaws.com
+    Type: AWS::Lambda::Permission
+    Properties:
+        Action: lambda:InvokeFunction
+        SourceAccount:
+            Ref: AWS::AccountId
+        FunctionName:
+            Ref: CreatePartitionFunction
+        Principal: s3.amazonaws.com
 
-  
+  # The event bus to which Lambda error events are sent
+  LambdaDesintationEventBus:
+    Type: AWS::Events::EventBus
+    Properties: 
+      Name: !Ref LambdaDesintationEventBusName
+
+
   ### LOG DELIVERY ###
 
   # Firehose delivery stream that aggregates Auth0 events into log files 
